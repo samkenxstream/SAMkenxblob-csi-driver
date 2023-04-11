@@ -40,7 +40,7 @@ var (
 	blobfuseProxyEndpoint                  = flag.String("blobfuse-proxy-endpoint", "unix://tmp/blobfuse-proxy.sock", "blobfuse-proxy endpoint")
 	nodeID                                 = flag.String("nodeid", "", "node id")
 	version                                = flag.Bool("version", false, "Print the version and exit.")
-	metricsAddress                         = flag.String("metrics-address", "0.0.0.0:29634", "export the metrics")
+	metricsAddress                         = flag.String("metrics-address", "", "export the metrics")
 	kubeconfig                             = flag.String("kubeconfig", "", "Absolute path to the kubeconfig file. Required only when running out of cluster.")
 	driverName                             = flag.String("drivername", blob.DefaultDriverName, "name of the driver")
 	enableBlobfuseProxy                    = flag.Bool("enable-blobfuse-proxy", false, "using blobfuse proxy for mounts")
@@ -55,6 +55,9 @@ var (
 	appendTimeStampInCacheDir              = flag.Bool("append-timestamp-cache-dir", false, "append timestamp into cache directory on agent node")
 	mountPermissions                       = flag.Uint64("mount-permissions", 0777, "mounted folder permissions")
 	allowInlineVolumeKeyAccessWithIdentity = flag.Bool("allow-inline-volume-key-access-with-idenitity", false, "allow accessing storage account key using cluster identity for inline volume")
+	kubeAPIQPS                             = flag.Float64("kube-api-qps", 25.0, "QPS to use while communicating with the kubernetes apiserver.")
+	kubeAPIBurst                           = flag.Int("kube-api-burst", 50, "Burst to use while communicating with the kubernetes apiserver.")
+	appendMountErrorHelpLink               = flag.Bool("append-mount-error-help-link", true, "Whether to include a link for help with mount errors when a mount error occurs.")
 )
 
 func main() {
@@ -91,6 +94,9 @@ func handle() {
 		AppendTimeStampInCacheDir:              *appendTimeStampInCacheDir,
 		MountPermissions:                       *mountPermissions,
 		AllowInlineVolumeKeyAccessWithIdentity: *allowInlineVolumeKeyAccessWithIdentity,
+		AppendMountErrorHelpLink:               *appendMountErrorHelpLink,
+		KubeAPIQPS:                             *kubeAPIQPS,
+		KubeAPIBurst:                           *kubeAPIBurst,
 	}
 	driver := blob.NewDriver(&driverOptions)
 	if driver == nil {
@@ -100,6 +106,9 @@ func handle() {
 }
 
 func exportMetrics() {
+	if *metricsAddress == "" {
+		return
+	}
 	l, err := net.Listen("tcp", *metricsAddress)
 	if err != nil {
 		klog.Warningf("failed to get listener for metrics endpoint: %v", err)

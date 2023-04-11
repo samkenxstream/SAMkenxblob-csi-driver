@@ -19,17 +19,20 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"time"
+	"math/rand"
+	"strconv"
 
 	"sigs.k8s.io/blob-csi-driver/test/e2e/driver"
 	"sigs.k8s.io/blob-csi-driver/test/e2e/testsuites"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
+	admissionapi "k8s.io/pod-security-admission/api"
 )
 
 const (
@@ -42,14 +45,13 @@ var (
 
 var _ = ginkgo.Describe("[blob-csi-e2e] Pre-Provisioned", func() {
 	f := framework.NewDefaultFramework("blob")
+	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
 
 	var (
 		cs         clientset.Interface
 		ns         *v1.Namespace
 		testDriver driver.PreProvisionedVolumeTestDriver
 		volumeID   string
-		// Set to true if the volume should be deleted automatically after test
-		skipManuallyDeletingVolume bool
 	)
 
 	ginkgo.BeforeEach(func() {
@@ -64,29 +66,23 @@ var _ = ginkgo.Describe("[blob-csi-e2e] Pre-Provisioned", func() {
 		cs = f.ClientSet
 		ns = f.Namespace
 		testDriver = driver.InitBlobCSIDriver()
-	})
 
-	ginkgo.AfterEach(func() {
-		if !skipManuallyDeletingVolume {
-			req := &csi.DeleteVolumeRequest{
-				VolumeId: volumeID,
-			}
-			_, err := blobDriver.DeleteVolume(context.Background(), req)
-			if err != nil {
-				ginkgo.Fail(fmt.Sprintf("delete volume %q error: %v", volumeID, err))
-			}
-		}
+		volName := fmt.Sprintf("pre-provisioned-%d-%v", ginkgo.GinkgoParallelProcess(), strconv.Itoa(rand.Intn(10000)))
+		resp, err := blobDriver.CreateVolume(context.Background(), makeCreateVolumeReq(volName, ns.Name))
+		framework.ExpectNoError(err, "create volume error")
+		volumeID = resp.Volume.VolumeId
+
+		ginkgo.DeferCleanup(func() {
+			_, err := blobDriver.DeleteVolume(
+				context.Background(),
+				&csi.DeleteVolumeRequest{
+					VolumeId: volumeID,
+				})
+			framework.ExpectNoError(err, "delete volume %s error", volumeID)
+		})
 	})
 
 	ginkgo.It("[env] should use a pre-provisioned volume and mount it as readOnly in a pod", func() {
-		req := makeCreateVolumeReq("pre-provisioned-readonly", ns.Name)
-		resp, err := blobDriver.CreateVolume(context.Background(), req)
-		if err != nil {
-			ginkgo.Fail(fmt.Sprintf("create volume error: %v", err))
-		}
-		volumeID = resp.Volume.VolumeId
-		ginkgo.By(fmt.Sprintf("Successfully provisioned blob volume: %q\n", volumeID))
-
 		volumeSize := fmt.Sprintf("%dGi", defaultVolumeSize)
 		pods := []testsuites.PodDetails{
 			{
@@ -113,14 +109,6 @@ var _ = ginkgo.Describe("[blob-csi-e2e] Pre-Provisioned", func() {
 	})
 
 	ginkgo.It(fmt.Sprintf("[env] should use a pre-provisioned volume and retain PV with reclaimPolicy %q", v1.PersistentVolumeReclaimRetain), func() {
-		req := makeCreateVolumeReq("pre-provisioned-retain-reclaimpolicy", ns.Name)
-		resp, err := blobDriver.CreateVolume(context.Background(), req)
-		if err != nil {
-			ginkgo.Fail(fmt.Sprintf("create volume error: %v", err))
-		}
-		volumeID = resp.Volume.VolumeId
-		ginkgo.By(fmt.Sprintf("Successfully provisioned blob volume: %q\n", volumeID))
-
 		volumeSize := fmt.Sprintf("%dGi", defaultVolumeSize)
 		reclaimPolicy := v1.PersistentVolumeReclaimRetain
 		volumes := []testsuites.VolumeDetails{
@@ -142,19 +130,14 @@ var _ = ginkgo.Describe("[blob-csi-e2e] Pre-Provisioned", func() {
 		volumeSize := fmt.Sprintf("%dGi", defaultVolumeSize)
 		pods := []testsuites.PodDetails{}
 		for i := 1; i <= 6; i++ {
-			req := makeCreateVolumeReq(fmt.Sprintf("pre-provisioned-multiple-pods%d", time.Now().UnixNano()), ns.Name)
-			resp, err := blobDriver.CreateVolume(context.Background(), req)
-			if err != nil {
-				ginkgo.Fail(fmt.Sprintf("create volume error: %v", err))
-			}
-			volumeID = resp.Volume.VolumeId
-			ginkgo.By(fmt.Sprintf("Successfully provisioned blob volume: %q\n", volumeID))
-
 			pod := testsuites.PodDetails{
 				Cmd: "echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data",
 				Volumes: []testsuites.VolumeDetails{
 					{
-						VolumeID:  volumeID,
+						// make VolumeID unique in test
+						// to workaround the issue: https://github.com/kubernetes/kubernetes/pull/107065
+						// which was fixed in k8s 1.24
+						VolumeID:  fmt.Sprintf("%s%d", volumeID, i),
 						ClaimSize: volumeSize,
 						VolumeMount: testsuites.VolumeMountDetails{
 							NameGenerate:      "test-volume-",
@@ -174,14 +157,6 @@ var _ = ginkgo.Describe("[blob-csi-e2e] Pre-Provisioned", func() {
 	})
 
 	ginkgo.It("should use existing credentials in k8s cluster", func() {
-		req := makeCreateVolumeReq("pre-provisioned-existing-credentials", ns.Name)
-		resp, err := blobDriver.CreateVolume(context.Background(), req)
-		if err != nil {
-			ginkgo.Fail(fmt.Sprintf("create volume error: %v", err))
-		}
-		volumeID = resp.Volume.VolumeId
-		ginkgo.By(fmt.Sprintf("Successfully provisioned blob volume: %q\n", volumeID))
-
 		volumeSize := fmt.Sprintf("%dGi", defaultVolumeSize)
 		reclaimPolicy := v1.PersistentVolumeReclaimRetain
 		volumeBindingMode := storagev1.VolumeBindingImmediate
@@ -211,15 +186,7 @@ var _ = ginkgo.Describe("[blob-csi-e2e] Pre-Provisioned", func() {
 		test.Run(cs, ns)
 	})
 
-	ginkgo.It("should use provided credentials", func() {
-		req := makeCreateVolumeReq("pre-provisioned-provided-credentials", ns.Name)
-		resp, err := blobDriver.CreateVolume(context.Background(), req)
-		if err != nil {
-			ginkgo.Fail(fmt.Sprintf("create volume error: %v", err))
-		}
-		volumeID = resp.Volume.VolumeId
-		ginkgo.By(fmt.Sprintf("Successfully provisioned blob volume: %q\n", volumeID))
-
+	ginkgo.It("should use provided credentials", ginkgo.Label("flaky"), func() {
 		volumeSize := fmt.Sprintf("%dGi", defaultVolumeSize)
 		reclaimPolicy := v1.PersistentVolumeReclaimRetain
 		volumeBindingMode := storagev1.VolumeBindingImmediate
@@ -239,11 +206,74 @@ var _ = ginkgo.Describe("[blob-csi-e2e] Pre-Provisioned", func() {
 							MountPathGenerate: "/mnt/test-",
 						},
 						NodeStageSecretRef: "azure-secret",
+						Attrib:             make(map[string]string),
 					},
 				},
 			},
 		}
 		test := testsuites.PreProvisionedProvidedCredentiasTest{
+			CSIDriver: testDriver,
+			Pods:      pods,
+			Driver:    blobDriver,
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("should use Key Vault", func() {
+		volumeSize := fmt.Sprintf("%dGi", defaultVolumeSize)
+		reclaimPolicy := v1.PersistentVolumeReclaimRetain
+		volumeBindingMode := storagev1.VolumeBindingImmediate
+
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: "echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data",
+				Volumes: []testsuites.VolumeDetails{
+					{
+						VolumeID:          volumeID,
+						FSType:            "ext4",
+						ClaimSize:         volumeSize,
+						ReclaimPolicy:     &reclaimPolicy,
+						VolumeBindingMode: &volumeBindingMode,
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+						Attrib: make(map[string]string),
+					},
+				},
+			},
+		}
+
+		test := testsuites.PreProvisionedKeyVaultTest{
+			CSIDriver: testDriver,
+			Pods:      pods,
+			Driver:    blobDriver,
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("should use SAS token", func() {
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: "echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data",
+				Volumes: []testsuites.VolumeDetails{
+					{
+						VolumeID:          volumeID,
+						FSType:            "ext4",
+						ClaimSize:         fmt.Sprintf("%dGi", defaultVolumeSize),
+						ReclaimPolicy:     to.Ptr(v1.PersistentVolumeReclaimRetain),
+						VolumeBindingMode: to.Ptr(storagev1.VolumeBindingImmediate),
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+						Attrib: make(map[string]string),
+					},
+				},
+			},
+		}
+
+		test := testsuites.PreProvisionedSASTokenTest{
 			CSIDriver: testDriver,
 			Pods:      pods,
 			Driver:    blobDriver,

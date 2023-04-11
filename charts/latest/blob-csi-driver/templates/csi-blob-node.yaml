@@ -56,6 +56,9 @@ spec:
 {{- toYaml .Values.node.affinity | nindent 8 }}
         {{- end }}
       priorityClassName: {{ .Values.priorityClassName | quote }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
 {{- with .Values.node.tolerations }}
       tolerations:
 {{ toYaml . | indent 8 }}
@@ -80,6 +83,10 @@ spec:
               value: "{{ .Values.node.blobfuseProxy.installBlobfuse }}"
             - name: BLOBFUSE_VERSION
               value: "{{ .Values.node.blobfuseProxy.blobfuseVersion }}"
+            - name: INSTALL_BLOBFUSE2
+              value: "{{ .Values.node.blobfuseProxy.installBlobfuse2 }}"
+            - name: BLOBFUSE2_VERSION
+              value: "{{ .Values.node.blobfuseProxy.blobfuse2Version }}"
             - name: SET_MAX_OPEN_FILE_NUM
               value: "{{ .Values.node.blobfuseProxy.setMaxOpenFileNum }}"
             - name: MAX_FILE_NUM
@@ -150,7 +157,6 @@ spec:
             - "--blobfuse-proxy-endpoint=$(BLOBFUSE_PROXY_ENDPOINT)"
             - "--enable-blobfuse-proxy={{ .Values.node.enableBlobfuseProxy }}"
             - "--nodeid=$(KUBE_NODE_NAME)"
-            - "--metrics-address=0.0.0.0:{{ .Values.node.metricsPort }}"
             - "--drivername={{ .Values.driver.name }}"
             - "--cloud-config-secret-name={{ .Values.node.cloudConfigSecretName }}"
             - "--cloud-config-secret-namespace={{ .Values.node.cloudConfigSecretNamespace }}"
@@ -184,6 +190,14 @@ spec:
               value: unix:///csi/csi.sock
             - name: BLOBFUSE_PROXY_ENDPOINT
               value: unix:///csi/blobfuse-proxy.sock
+            {{- if ne .Values.driver.httpsProxy "" }}
+            - name: HTTPS_PROXY
+              value: {{ .Values.driver.httpsProxy }}
+            {{- end }}
+            {{- if ne .Values.driver.httpProxy "" }}
+            - name: HTTP_PROXY
+              value: {{ .Values.driver.httpProxy }}
+            {{- end }}
             - name: KUBE_NODE_NAME
               valueFrom:
                 fieldRef:

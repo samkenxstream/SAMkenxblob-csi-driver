@@ -82,17 +82,21 @@ kubectl create secret generic azure-secret --from-literal azurestorageaccountnam
 apiVersion: v1
 kind: PersistentVolume
 metadata:
+  annotations:
+    pv.kubernetes.io/provisioned-by: blob.csi.azure.com
   name: pv-blob
 spec:
   capacity:
     storage: 10Gi
   accessModes:
     - ReadWriteMany
-  persistentVolumeReclaimPolicy: Retain  # "Delete" is not supported in static provisioning
+  persistentVolumeReclaimPolicy: Retain
   csi:
     driver: blob.csi.azure.com
     readOnly: false
-    volumeHandle: unique-volumeid  # make sure this volumeid is unique in the cluster
+    # make sure volumeid is unique for every storage blob container in the cluster
+    # the # character is reserved for internal use
+    volumeHandle: account-name_container-name
     volumeAttributes:
       containerName: EXISTING_CONTAINER_NAME
     nodeStageSecretRef:

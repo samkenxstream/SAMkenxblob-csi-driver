@@ -19,7 +19,7 @@ package testsuites
 import (
 	"fmt"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 
 	"sigs.k8s.io/blob-csi-driver/pkg/blob"
 	"sigs.k8s.io/blob-csi-driver/test/e2e/driver"
@@ -39,7 +39,7 @@ type PreProvisionedExistingCredentialsTest struct {
 func (t *PreProvisionedExistingCredentialsTest) Run(client clientset.Interface, namespace *v1.Namespace) {
 	for _, pod := range t.Pods {
 		for n, volume := range pod.Volumes {
-			resourceGroupName, accountName, containerName, _, err := blob.GetContainerInfo(volume.VolumeID)
+			resourceGroupName, accountName, containerName, _, _, err := blob.GetContainerInfo(volume.VolumeID)
 			if err != nil {
 				framework.ExpectNoError(err, fmt.Sprintf("Error GetContainerInfo from volumeID(%s): %v", volume.VolumeID, err))
 				return
@@ -51,7 +51,7 @@ func (t *PreProvisionedExistingCredentialsTest) Run(client clientset.Interface, 
 			}
 
 			ginkgo.By("creating the storageclass with existing credentials")
-			sc := t.CSIDriver.GetPreProvisionStorageClass(parameters, volume.MountOptions, volume.ReclaimPolicy, volume.VolumeBindingMode, volume.AllowedTopologyValues, namespace.Name)
+			sc := t.CSIDriver.GetProvisionStorageClass(parameters, volume.MountOptions, volume.ReclaimPolicy, volume.VolumeBindingMode, volume.AllowedTopologyValues, namespace.Name)
 			tsc := NewTestStorageClass(client, namespace, sc)
 			createdStorageClass := tsc.Create()
 			defer tsc.Cleanup()

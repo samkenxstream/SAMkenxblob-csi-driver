@@ -1,6 +1,8 @@
 ## CSI driver troubleshooting guide
 ### Case#1: volume create/delete issue
- - locate csi driver pod
+> This step is not applicable if you are using [managed CSI driver on AKS](https://docs.microsoft.com/en-us/azure/aks/azure-csi-blob-storage-dynamic).
+ - find csi driver controller pod
+> There could be multiple controller pods (only one pod is the leader), if there are no helpful logs, try to get logs from the leader controller pod.
 ```console
 kubectl get po -o wide -n kube-system | grep csi-blob-controller
 ```
@@ -9,12 +11,12 @@ NAME                                       READY   STATUS    RESTARTS   AGE     
 csi-blob-controller-56bfddd689-dh5tk       4/4     Running   0          35s     10.240.0.19    k8s-agentpool-22533604-0
 csi-blob-controller-56bfddd689-sl4ll       4/4     Running   0          35s     10.240.0.23    k8s-agentpool-22533604-1
 </pre>
- - get csi driver logs
+
+ - get pod description and logs
 ```console
+kubectl describe pod csi-blob-controller-56bfddd689-dh5tk -n kube-system > csi-blob-controller-description.log
 kubectl logs csi-blob-controller-56bfddd689-dh5tk -c blob -n kube-system > csi-blob-controller.log
 ```
-> note: there could be multiple controller pods, logs can be taken from all of them simultaneously, also with `follow` (realtime) mode
-> `kubectl logs deploy/csi-blob-controller -c blob -f -n kube-system`
 
 ### Case#2: volume mount/unmount failed
  - locate csi driver pod and make sure which pod does the actual volume mount/unmount
@@ -27,13 +29,18 @@ csi-blob-node-cvgbs                        3/3     Running   0          7m4s    
 csi-blob-node-dr4s4                        3/3     Running   0          7m4s    10.240.0.4     k8s-agentpool-22533604-0
 </pre>
 
- - get csi driver logs
+ - get pod description and logs
 ```console
+kubectl describe pod csi-blob-node-cvgbs -n kube-system > csi-blob-node-description.log
 kubectl logs csi-blob-node-cvgbs -c blob -n kube-system > csi-blob-node.log
 ```
 > note: to watch logs in realtime from multiple `csi-blob-node` DaemonSet pods simultaneously, run the command:
 > ```console
 > kubectl logs daemonset/csi-blob-node -c blob -n kube-system -f
+> ```
+> get blobfuse-proxy logs on the node
+> ```console
+> journalctl -u blobfuse-proxy -l
 > ```
 
  - check blobfuse mount inside driver
@@ -89,7 +96,7 @@ mount | grep blobfuse | uniq
 ### troubleshooting connection failure on agent node
  - blobfuse
 
-Blobfuse mount will fail due to incorrect storage account name, key or container name, run below commands to check whether blobfuse mount would work on agent node:
+To check if blobfuse mount would work on the agent node, run the following commands to verify that the storage account name, key, and container name are correct. If any of these are incorrect, the blobfuse mount will fail:
 ```console
 mkdir test
 export AZURE_STORAGE_ACCOUNT=
@@ -98,10 +105,45 @@ export AZURE_STORAGE_ACCESS_KEY=
 # export AZURE_STORAGE_BLOB_ENDPOINT=accountname.blob.core.chinacloudapi.cn
 blobfuse test --container-name=CONTAINER-NAME --tmp-path=/tmp/blobfuse -o allow_other --file-cache-timeout-in-seconds=120
 ```
+> You can find more detailed information about environment variables at https://github.com/Azure/azure-storage-fuse#environment-variables.
 
  - NFSv3
  
 ```console
 mkdir /tmp/test
-mount -t nfs -o sec=sys,vers=3,nolock accountname.blob.core.windows.net:/accountname/container-name /tmp/test
+mount -v -t nfs -o sec=sys,vers=3,nolock accountname.blob.core.windows.net:/accountname/container-name /tmp/test
 ```
+
+<details><summary>
+Get client-side logs on AKS Linux node if there is mount error 
+</summary>
+
+```console
+# get ama-logs pod which is running on the AKS Linux node
+kubectl get po -n kube-system -o wide | grep ama-logs
+# get blobfuse logs
+kubectl -n kube-system cp ama-logs-xxxx:/var/log/blobfuse.log /tmp/blobfuse.log
+# get blobfuse2 logs
+kubectl -n kube-system cp ama-logs-xxxx:/var/log/blobfuse2.log /tmp/blobfuse2.log
+```
+
+</details>
+
+<details><summary>
+Get client-side logs on Linux node if there is mount error 
+</summary>
+
+```console
+kubectl debug node/node-name --image=nginx
+# get blobfuse logs
+kubectl cp node-debugger-node-name-xxxx:/host/var/log/blobfuse.log /tmp/blobfuse.log
+# get blobfuse2 logs
+kubectl cp node-debugger-node-name-xxxx:/host/var/log/blobfuse2.log /tmp/blobfuse2.log
+#after log collected, delete the debug pod by:
+kubectl delete po node-debugger-node-name-xxxx
+```
+ 
+</details>
+
+### Tips
+ - [Troubleshoot Azure Blob storage mount issues on AKS](http://aka.ms/blobmounterror)

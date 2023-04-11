@@ -27,6 +27,7 @@ import (
 	"github.com/Azure/go-autorest/autorest/azure"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/klog/v2"
+
 	azclients "sigs.k8s.io/cloud-provider-azure/pkg/azureclients"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/armclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
@@ -123,10 +124,7 @@ func (c *Client) createOrUpdateVirtualNetworkLink(ctx context.Context, resourceG
 		virtualNetworkLinkResourceType,
 		virtualNetworkLinkName,
 	)
-	decorators := []autorest.PrepareDecorator{
-		autorest.WithPathParameters("{resourceID}", map[string]interface{}{"resourceID": resourceID}),
-		autorest.WithJSON(parameters),
-	}
+	decorators := []autorest.PrepareDecorator{}
 	if etag != "" {
 		decorators = append(decorators, autorest.WithHeader("If-Match", autorest.String(etag)))
 	}
@@ -134,9 +132,9 @@ func (c *Client) createOrUpdateVirtualNetworkLink(ctx context.Context, resourceG
 	var response *http.Response
 	var rerr *retry.Error
 	if waitForCompletion {
-		response, rerr = c.armClient.PutResourceWithDecorators(ctx, resourceID, parameters, decorators)
+		response, rerr = c.armClient.PutResource(ctx, resourceID, parameters, decorators...)
 	} else {
-		response, rerr = c.armClient.PutResourceWithDecoratorsAsync(ctx, resourceID, parameters, decorators)
+		_, rerr = c.armClient.PutResourceAsync(ctx, resourceID, parameters, decorators...)
 	}
 	defer c.armClient.CloseResponse(ctx, response)
 	if rerr != nil {

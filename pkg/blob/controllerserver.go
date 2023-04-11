@@ -25,18 +25,23 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-02-01/storage"
+	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	azstorage "github.com/Azure/azure-sdk-for-go/storage"
-	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/pointer"
 
 	"sigs.k8s.io/blob-csi-driver/pkg/util"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
+)
+
+const (
+	privateEndpoint = "privateendpoint"
 )
 
 // CreateVolume provisions a volume
@@ -68,11 +73,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		parameters = make(map[string]string)
 	}
 	var storageAccountType, subsID, resourceGroup, location, account, containerName, containerNamePrefix, protocol, customTags, secretName, secretNamespace, pvcNamespace string
-	var isHnsEnabled *bool
-	var vnetResourceGroup, vnetName, subnetName string
+	var isHnsEnabled, requireInfraEncryption, enableBlobVersioning *bool
+	var vnetResourceGroup, vnetName, subnetName, accessTier, networkEndpointType, storageEndpointSuffix string
 	var matchTags, useDataPlaneAPI bool
+	var softDeleteBlobs, softDeleteContainers int32
 	// set allowBlobPublicAccess as false by default
-	allowBlobPublicAccess := to.BoolPtr(false)
+	allowBlobPublicAccess := pointer.Bool(false)
 
 	containerNameReplaceMap := map[string]string{}
 
@@ -111,15 +117,33 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			secretNamespace = v
 		case isHnsEnabledField:
 			if strings.EqualFold(v, trueValue) {
-				isHnsEnabled = to.BoolPtr(true)
+				isHnsEnabled = pointer.Bool(true)
 			}
+		case softDeleteBlobsField:
+			days, err := parseDays(v)
+			if err != nil {
+				return nil, err
+			}
+			softDeleteBlobs = days
+		case softDeleteContainersField:
+			days, err := parseDays(v)
+			if err != nil {
+				return nil, err
+			}
+			softDeleteContainers = days
+		case enableBlobVersioningField:
+			enableBlobVersioning = pointer.Bool(strings.EqualFold(v, trueValue))
 		case storeAccountKeyField:
 			if strings.EqualFold(v, falseValue) {
 				storeAccountKey = false
 			}
 		case allowBlobPublicAccessField:
 			if strings.EqualFold(v, trueValue) {
-				allowBlobPublicAccess = to.BoolPtr(true)
+				allowBlobPublicAccess = pointer.Bool(true)
+			}
+		case requireInfraEncryptionField:
+			if strings.EqualFold(v, trueValue) {
+				requireInfraEncryption = pointer.Bool(true)
 			}
 		case pvcNamespaceKey:
 			pvcNamespace = v
@@ -131,13 +155,17 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		case serverNameField:
 			// no op, only used in NodeStageVolume
 		case storageEndpointSuffixField:
-			// no op, only used in NodeStageVolume
+			storageEndpointSuffix = v
 		case vnetResourceGroupField:
 			vnetResourceGroup = v
 		case vnetNameField:
 			vnetName = v
 		case subnetNameField:
 			subnetName = v
+		case accessTierField:
+			accessTier = v
+		case networkEndpointTypeField:
+			networkEndpointType = v
 		case mountPermissionsField:
 			// only do validations here, used in NodeStageVolume, NodePublishVolume
 			if v != "" {
@@ -152,12 +180,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 	}
 
+	if pointer.BoolDeref(enableBlobVersioning, false) {
+		if protocol == NFS || pointer.BoolDeref(isHnsEnabled, false) {
+			return nil, status.Errorf(codes.InvalidArgument, "enableBlobVersioning is not supported for NFS protocol or HNS enabled account")
+		}
+	}
+
 	if matchTags && account != "" {
 		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("matchTags must set as false when storageAccount(%s) is provided", account))
 	}
 
 	if subsID != "" && subsID != d.cloud.SubscriptionID {
-		if protocol == nfs {
+		if protocol == NFS {
 			return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("NFS protocol is not supported in cross subscription(%s)", subsID))
 		}
 		if !storeAccountKey {
@@ -178,10 +212,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	if protocol == "" {
-		protocol = fuse
+		protocol = Fuse
 	}
 	if !isSupportedProtocol(protocol) {
 		return nil, status.Errorf(codes.InvalidArgument, "protocol(%s) is not supported, supported protocol list: %v", protocol, supportedProtocolList)
+	}
+	if !isSupportedAccessTier(accessTier) {
+		return nil, status.Errorf(codes.InvalidArgument, "accessTier(%s) is not supported, supported AccessTier list: %v", accessTier, storage.PossibleAccessTierValues())
 	}
 
 	if containerName != "" && containerNamePrefix != "" {
@@ -192,24 +229,29 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	enableHTTPSTrafficOnly := true
+	createPrivateEndpoint := false
+	if strings.EqualFold(networkEndpointType, privateEndpoint) {
+		createPrivateEndpoint = true
+	}
 	accountKind := string(storage.KindStorageV2)
 	var (
 		vnetResourceIDs []string
 		enableNfsV3     *bool
 	)
-	if protocol == nfs {
-		enableHTTPSTrafficOnly = false
-		isHnsEnabled = to.BoolPtr(true)
-		enableNfsV3 = to.BoolPtr(true)
-		// set VirtualNetworkResourceIDs for storage account firewall setting
-		vnetResourceID := d.getSubnetResourceID()
-		klog.V(2).Infof("set vnetResourceID(%s) for NFS protocol", vnetResourceID)
-		vnetResourceIDs = []string{vnetResourceID}
-		if err := d.updateSubnetServiceEndpoints(ctx, vnetResourceGroup, vnetName, subnetName); err != nil {
-			return nil, status.Errorf(codes.Internal, "update service endpoints failed with error: %v", err)
-		}
+	if protocol == NFS {
+		isHnsEnabled = pointer.Bool(true)
+		enableNfsV3 = pointer.Bool(true)
 		// NFS protocol does not need account key
 		storeAccountKey = false
+		if !createPrivateEndpoint {
+			// set VirtualNetworkResourceIDs for storage account firewall setting
+			vnetResourceID := d.getSubnetResourceID(vnetResourceGroup, vnetName, subnetName)
+			klog.V(2).Infof("set vnetResourceID(%s) for NFS protocol", vnetResourceID)
+			vnetResourceIDs = []string{vnetResourceID}
+			if err := d.updateSubnetServiceEndpoints(ctx, vnetResourceGroup, vnetName, subnetName); err != nil {
+				return nil, status.Errorf(codes.Internal, "update service endpoints failed with error: %v", err)
+			}
+		}
 	}
 
 	if strings.HasPrefix(strings.ToLower(storageAccountType), "premium") {
@@ -224,26 +266,42 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	tags, err := util.ConvertTagsToMap(customTags)
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.InvalidArgument, err.Error())
+	}
+
+	if strings.TrimSpace(storageEndpointSuffix) == "" {
+		if d.cloud.Environment.StorageEndpointSuffix != "" {
+			storageEndpointSuffix = d.cloud.Environment.StorageEndpointSuffix
+		} else {
+			storageEndpointSuffix = defaultStorageEndPointSuffix
+		}
 	}
 
 	accountOptions := &azure.AccountOptions{
-		Name:                      account,
-		Type:                      storageAccountType,
-		Kind:                      accountKind,
-		SubscriptionID:            subsID,
-		ResourceGroup:             resourceGroup,
-		Location:                  location,
-		EnableHTTPSTrafficOnly:    enableHTTPSTrafficOnly,
-		VirtualNetworkResourceIDs: vnetResourceIDs,
-		Tags:                      tags,
-		MatchTags:                 matchTags,
-		IsHnsEnabled:              isHnsEnabled,
-		EnableNfsV3:               enableNfsV3,
-		AllowBlobPublicAccess:     allowBlobPublicAccess,
-		VNetResourceGroup:         vnetResourceGroup,
-		VNetName:                  vnetName,
-		SubnetName:                subnetName,
+		Name:                            account,
+		Type:                            storageAccountType,
+		Kind:                            accountKind,
+		SubscriptionID:                  subsID,
+		ResourceGroup:                   resourceGroup,
+		Location:                        location,
+		EnableHTTPSTrafficOnly:          enableHTTPSTrafficOnly,
+		VirtualNetworkResourceIDs:       vnetResourceIDs,
+		Tags:                            tags,
+		MatchTags:                       matchTags,
+		IsHnsEnabled:                    isHnsEnabled,
+		EnableNfsV3:                     enableNfsV3,
+		AllowBlobPublicAccess:           allowBlobPublicAccess,
+		RequireInfrastructureEncryption: requireInfraEncryption,
+		VNetResourceGroup:               vnetResourceGroup,
+		VNetName:                        vnetName,
+		SubnetName:                      subnetName,
+		AccessTier:                      accessTier,
+		CreatePrivateEndpoint:           createPrivateEndpoint,
+		StorageType:                     provider.StorageTypeBlob,
+		StorageEndpointSuffix:           storageEndpointSuffix,
+		EnableBlobVersioning:            enableBlobVersioning,
+		SoftDeleteBlobs:                 softDeleteBlobs,
+		SoftDeleteContainers:            softDeleteContainers,
 	}
 
 	var accountKey string
@@ -253,11 +311,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if v, ok := d.volMap.Load(volName); ok {
 			accountName = v.(string)
 		} else {
-			lockKey := fmt.Sprintf("%s%s%s%s%s", storageAccountType, accountKind, resourceGroup, location, protocol)
+			lockKey := fmt.Sprintf("%s%s%s%s%s%v", storageAccountType, accountKind, resourceGroup, location, protocol, createPrivateEndpoint)
 			// search in cache first
 			cache, err := d.accountSearchCache.Get(lockKey, azcache.CacheReadTypeDefault)
 			if err != nil {
-				return nil, err
+				return nil, status.Errorf(codes.Internal, err.Error())
 			}
 			if cache != nil {
 				accountName = cache.(string)
@@ -280,6 +338,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 				d.volMap.Store(volName, accountName)
 			}
 		}
+	}
+
+	if createPrivateEndpoint && protocol == NFS {
+		// As for blobfuse/blobfuse2, serverName, i.e.,AZURE_STORAGE_BLOB_ENDPOINT env variable can't include
+		// "privatelink", issue: https://github.com/Azure/azure-storage-fuse/issues/1014
+		//
+		// And use public endpoint will be befine to blobfuse/blobfuse2, because it will be resolved to private endpoint
+		// by private dns zone, which includes CNAME record, documented here:
+		// https://learn.microsoft.com/en-us/azure/storage/common/storage-private-endpoints?toc=%2Fazure%2Fstorage%2Fblobs%2Ftoc.json&bc=%2Fazure%2Fstorage%2Fblobs%2Fbreadcrumb%2Ftoc.json#dns-changes-for-private-endpoints
+		setKeyValueInMap(parameters, serverNameField, fmt.Sprintf("%s.privatelink.blob.%s", accountName, storageEndpointSuffix))
 	}
 
 	accountOptions.Name = accountName
@@ -311,8 +379,8 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
 	}()
 
-	klog.V(2).Infof("begin to create container(%s) on account(%s) type(%s) rg(%s) location(%s) size(%d)", validContainerName, accountName, storageAccountType, resourceGroup, location, requestGiB)
-	if err := d.CreateBlobContainer(ctx, resourceGroup, accountName, validContainerName, secrets); err != nil {
+	klog.V(2).Infof("begin to create container(%s) on account(%s) type(%s) subsID(%s) rg(%s) location(%s) size(%d)", validContainerName, accountName, storageAccountType, subsID, resourceGroup, location, requestGiB)
+	if err := d.CreateBlobContainer(ctx, subsID, resourceGroup, accountName, validContainerName, secrets); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create container(%s) on account(%s) type(%s) rg(%s) location(%s) size(%d), error: %v", validContainerName, accountName, storageAccountType, resourceGroup, location, requestGiB, err)
 	}
 
@@ -323,7 +391,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			}
 		}
 
-		secretName, err := setAzureCredentials(d.cloud.KubeClient, accountName, accountKey, secretNamespace)
+		secretName, err := setAzureCredentials(ctx, d.cloud.KubeClient, accountName, accountKey, secretNamespace)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to store storage account key: %v", err)
 		}
@@ -338,12 +406,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		// not necessary for dynamic container name creation since volumeID already contains volume name
 		uuid = volName
 	}
-	volumeID = fmt.Sprintf(volumeIDTemplate, resourceGroup, accountName, validContainerName, uuid, secretNamespace)
+	volumeID = fmt.Sprintf(volumeIDTemplate, resourceGroup, accountName, validContainerName, uuid, secretNamespace, subsID)
 	klog.V(2).Infof("create container %s on storage account %s successfully", validContainerName, accountName)
 
 	if useDataPlaneAPI {
-		d.dataPlaneAPIVolMap.Store(volumeID, "")
-		d.dataPlaneAPIVolMap.Store(accountName, "")
+		d.dataPlaneAPIVolCache.Set(volumeID, "")
+		d.dataPlaneAPIVolCache.Set(accountName, "")
 	}
 
 	isOperationSucceeded = true
@@ -366,7 +434,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	}
 
 	if err := d.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
-		return nil, fmt.Errorf("invalid delete volume req: %v", req)
+		return nil, status.Errorf(codes.Internal, "invalid delete volume req: %v", req)
 	}
 
 	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
@@ -374,7 +442,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	}
 	defer d.volumeLocks.Release(volumeID)
 
-	resourceGroupName, accountName, containerName, _, err := GetContainerInfo(volumeID)
+	resourceGroupName, accountName, containerName, _, subsID, err := GetContainerInfo(volumeID)
 	if err != nil {
 		// According to CSI Driver Sanity Tester, should succeed when an invalid volume id is used
 		klog.Errorf("GetContainerInfo(%s) in DeleteVolume failed with error: %v", volumeID, err)
@@ -402,7 +470,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		resourceGroupName = d.cloud.ResourceGroup
 	}
 	klog.V(2).Infof("deleting container(%s) rg(%s) account(%s) volumeID(%s)", containerName, resourceGroupName, accountName, volumeID)
-	if err := d.DeleteBlobContainer(ctx, resourceGroupName, accountName, containerName, secrets); err != nil {
+	if err := d.DeleteBlobContainer(ctx, subsID, resourceGroupName, accountName, containerName, secrets); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to delete container(%s) under rg(%s) account(%s) volumeID(%s), error: %v", containerName, resourceGroupName, accountName, volumeID, err)
 	}
 
@@ -421,7 +489,7 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	resourceGroupName, accountName, containerName, _, err := GetContainerInfo(volumeID)
+	resourceGroupName, accountName, containerName, _, subsID, err := GetContainerInfo(volumeID)
 	if err != nil {
 		klog.Errorf("GetContainerInfo(%s) in ValidateVolumeCapabilities failed with error: %v", volumeID, err)
 		return nil, status.Error(codes.NotFound, err.Error())
@@ -442,7 +510,8 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 		if resourceGroupName == "" {
 			resourceGroupName = d.cloud.ResourceGroup
 		}
-		blobContainer, err := d.cloud.BlobClient.GetContainer(ctx, resourceGroupName, accountName, containerName)
+		blobContainer, retryErr := d.cloud.BlobClient.GetContainer(ctx, subsID, resourceGroupName, accountName, containerName)
+		err = retryErr.Error()
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
@@ -521,7 +590,7 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	}
 
 	if err := d.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_EXPAND_VOLUME); err != nil {
-		return nil, fmt.Errorf("invalid expand volume req: %v", req)
+		return nil, status.Errorf(codes.Internal, "invalid expand volume req: %v", req)
 	}
 
 	volSizeBytes := int64(req.GetCapacityRange().GetRequiredBytes())
@@ -537,7 +606,7 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 }
 
 // CreateBlobContainer creates a blob container
-func (d *Driver) CreateBlobContainer(ctx context.Context, resourceGroupName, accountName, containerName string, secrets map[string]string) error {
+func (d *Driver) CreateBlobContainer(ctx context.Context, subsID, resourceGroupName, accountName, containerName string, secrets map[string]string) error {
 	if containerName == "" {
 		return fmt.Errorf("containerName is empty")
 	}
@@ -555,7 +624,7 @@ func (d *Driver) CreateBlobContainer(ctx context.Context, resourceGroupName, acc
 					PublicAccess: storage.PublicAccessNone,
 				},
 			}
-			err = d.cloud.BlobClient.CreateContainer(ctx, resourceGroupName, accountName, containerName, blobContainer)
+			err = d.cloud.BlobClient.CreateContainer(ctx, subsID, resourceGroupName, accountName, containerName, blobContainer).Error()
 		}
 		if err != nil {
 			if strings.Contains(err.Error(), containerBeingDeletedDataplaneAPIError) ||
@@ -569,7 +638,7 @@ func (d *Driver) CreateBlobContainer(ctx context.Context, resourceGroupName, acc
 }
 
 // DeleteBlobContainer deletes a blob container
-func (d *Driver) DeleteBlobContainer(ctx context.Context, resourceGroupName, accountName, containerName string, secrets map[string]string) error {
+func (d *Driver) DeleteBlobContainer(ctx context.Context, subsID, resourceGroupName, accountName, containerName string, secrets map[string]string) error {
 	if containerName == "" {
 		return fmt.Errorf("containerName is empty")
 	}
@@ -582,7 +651,7 @@ func (d *Driver) DeleteBlobContainer(ctx context.Context, resourceGroupName, acc
 			}
 			_, err = container.DeleteIfExists(nil)
 		} else {
-			err = d.cloud.BlobClient.DeleteContainer(ctx, resourceGroupName, accountName, containerName)
+			err = d.cloud.BlobClient.DeleteContainer(ctx, subsID, resourceGroupName, accountName, containerName).Error()
 		}
 		if err != nil {
 			if strings.Contains(err.Error(), containerBeingDeletedDataplaneAPIError) ||
@@ -609,4 +678,16 @@ func isValidVolumeCapabilities(volCaps []*csi.VolumeCapability) error {
 		}
 	}
 	return nil
+}
+
+func parseDays(dayStr string) (int32, error) {
+	days, err := strconv.Atoi(dayStr)
+	if err != nil {
+		return 0, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid %s:%s in storage class", softDeleteBlobsField, dayStr))
+	}
+	if days <= 0 || days > 365 {
+		return 0, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid %s:%s in storage class, should be in range [1, 365]", softDeleteBlobsField, dayStr))
+	}
+
+	return int32(days), nil
 }

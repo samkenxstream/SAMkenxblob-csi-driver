@@ -24,14 +24,19 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider"
 
+	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 
 	mount "k8s.io/mount-utils"
@@ -235,6 +240,7 @@ func TestNodePublishVolume(t *testing.T) {
 	_ = makeDir(sourceTest)
 	_ = makeDir(targetTest)
 	d := NewFakeDriver()
+	d.cloud = provider.GetTestCloud(gomock.NewController(t))
 	fakeMounter := &fakeMounter{}
 	fakeExec := &testingexec.FakeExec{ExactOrder: true}
 	d.mounter = &mount.SafeFormatAndMount{
@@ -243,6 +249,7 @@ func TestNodePublishVolume(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		d.cloud.ResourceGroup = "rg"
 		if test.setup != nil {
 			test.setup(d)
 		}
@@ -456,6 +463,102 @@ func TestNodeStageVolume(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "[Error] Could not mount to target",
+			testFunc: func(t *testing.T) {
+				req := &csi.NodeStageVolumeRequest{
+					VolumeId:          "unit-test",
+					StagingTargetPath: "error_is_likely",
+					VolumeCapability:  &csi.VolumeCapability{AccessMode: &volumeCap},
+					VolumeContext: map[string]string{
+						mountPermissionsField: "0755",
+					},
+				}
+				d := NewFakeDriver()
+				fakeMounter := &fakeMounter{}
+				fakeExec := &testingexec.FakeExec{}
+				d.mounter = &mount.SafeFormatAndMount{
+					Interface: fakeMounter,
+					Exec:      fakeExec,
+				}
+				_, err := d.NodeStageVolume(context.TODO(), req)
+				expectedErr := status.Error(codes.Internal, fmt.Sprintf("Could not mount target %q: %v", req.StagingTargetPath, fmt.Errorf("fake IsLikelyNotMountPoint: fake error")))
+				if !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("actualErr: (%v), expectedErr: (%v)", err, expectedErr)
+				}
+			},
+		},
+		{
+			name: "protocol = nfs",
+			testFunc: func(t *testing.T) {
+				req := &csi.NodeStageVolumeRequest{
+					VolumeId:          "rg#acc#cont#ns",
+					StagingTargetPath: targetTest,
+					VolumeCapability:  &csi.VolumeCapability{AccessMode: &volumeCap},
+					VolumeContext: map[string]string{
+						mountPermissionsField: "0755",
+						protocolField:         "nfs",
+					},
+					Secrets: map[string]string{},
+				}
+				d := NewFakeDriver()
+				d.cloud = provider.GetTestCloud(gomock.NewController(t))
+				d.cloud.ResourceGroup = "rg"
+				d.enableBlobMockMount = true
+				fakeMounter := &fakeMounter{}
+				fakeExec := &testingexec.FakeExec{}
+				d.mounter = &mount.SafeFormatAndMount{
+					Interface: fakeMounter,
+					Exec:      fakeExec,
+				}
+
+				_, err := d.NodeStageVolume(context.TODO(), req)
+				//expectedErr := nil
+				if !reflect.DeepEqual(err, nil) {
+					t.Errorf("actualErr: (%v), expectedErr: (%v)", err, nil)
+				}
+			},
+		},
+		{
+			name: "BlobMockMount Enabled",
+			testFunc: func(t *testing.T) {
+				req := &csi.NodeStageVolumeRequest{
+					VolumeId:          "rg#acc#cont#ns",
+					StagingTargetPath: targetTest,
+					VolumeCapability:  &csi.VolumeCapability{AccessMode: &volumeCap},
+					VolumeContext: map[string]string{
+						mountPermissionsField: "0755",
+						protocolField:         "protocol",
+					},
+					Secrets: map[string]string{},
+				}
+				d := NewFakeDriver()
+				d.cloud = provider.GetTestCloud(gomock.NewController(t))
+				d.cloud.ResourceGroup = "rg"
+				d.enableBlobMockMount = true
+				fakeMounter := &fakeMounter{}
+				fakeExec := &testingexec.FakeExec{}
+				d.mounter = &mount.SafeFormatAndMount{
+					Interface: fakeMounter,
+					Exec:      fakeExec,
+				}
+
+				keyList := make([]storage.AccountKey, 1)
+				fakeKey := "fakeKey"
+				fakeValue := "fakeValue"
+				keyList[0] = (storage.AccountKey{
+					KeyName: &fakeKey,
+					Value:   &fakeValue,
+				})
+				d.cloud.StorageAccountClient = NewMockSAClient(context.Background(), gomock.NewController(t), "subID", "unit-test", "unit-test", &keyList)
+
+				_, err := d.NodeStageVolume(context.TODO(), req)
+				//expectedErr := nil
+				if !reflect.DeepEqual(err, nil) {
+					t.Errorf("actualErr: (%v), expectedErr: (%v)", err, nil)
+				}
+			},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, tc.testFunc)
@@ -520,6 +623,12 @@ func TestNodeUnstageVolume(t *testing.T) {
 					StagingTargetPath: "./unit-test",
 				}
 				d := NewFakeDriver()
+				fakeMounter := &fakeMounter{}
+				fakeExec := &testingexec.FakeExec{}
+				d.mounter = &mount.SafeFormatAndMount{
+					Interface: fakeMounter,
+					Exec:      fakeExec,
+				}
 				_, err := d.NodeUnstageVolume(context.TODO(), req)
 				expectedErr := error(nil)
 				if !reflect.DeepEqual(err, expectedErr) {
@@ -634,7 +743,7 @@ func TestMountBlobfuseWithProxy(t *testing.T) {
 	args := "--tmp-path /tmp"
 	authEnv := []string{"username=blob", "authkey=blob"}
 	d := NewFakeDriver()
-	_, err := d.mountBlobfuseWithProxy(args, authEnv)
+	_, err := d.mountBlobfuseWithProxy(args, "fuse", authEnv)
 	// should be context.deadlineExceededError{} error
 	assert.NotNil(t, err)
 }
@@ -643,7 +752,63 @@ func TestMountBlobfuseInsideDriver(t *testing.T) {
 	args := "--tmp-path /tmp"
 	authEnv := []string{"username=blob", "authkey=blob"}
 	d := NewFakeDriver()
-	_, err := d.mountBlobfuseInsideDriver(args, authEnv)
+	_, err := d.mountBlobfuseInsideDriver(args, Fuse, authEnv)
 	// the error should be of type exec.ExitError
 	assert.NotNil(t, err)
+}
+
+func Test_waitForMount(t *testing.T) {
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		t.Skip("Skipping test on ", runtime.GOOS)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "")
+	assert.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	type args struct {
+		path     string
+		intervel time.Duration
+		timeout  time.Duration
+	}
+
+	tests := []struct {
+		name      string
+		args      args
+		wantErr   bool
+		subErrMsg string
+	}{
+		{
+			name: "test error timeout",
+			args: args{
+				path:     tmpDir,
+				intervel: 1 * time.Millisecond,
+				timeout:  10 * time.Millisecond,
+			},
+			wantErr:   true,
+			subErrMsg: "timeout",
+		},
+		{
+			name: "test error no such file or directory",
+			args: args{
+				path:     "/no/such/file/or/directory",
+				intervel: 1 * time.Millisecond,
+				timeout:  10 * time.Millisecond,
+			},
+			wantErr:   true,
+			subErrMsg: "no such file or directory",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := waitForMount(tt.args.path, tt.args.intervel, tt.args.timeout)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("waitForMount() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), tt.subErrMsg) {
+				t.Errorf("waitForMount() error = %v, wantErr %v", err, tt.subErrMsg)
+			}
+		})
+	}
 }

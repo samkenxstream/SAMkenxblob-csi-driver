@@ -5,6 +5,7 @@
 
 ### Tips
  - configure with [blobfuse-proxy](../deploy/blobfuse-proxy) to make blobfuse mount still available after driver restart
+ > note: [blobfuse-proxy](../deploy/blobfuse-proxy) is only available on **debian** OS based agent node (not available on OpenShift)
    - specify `node.enableBlobfuseProxy=true` together with [blobfuse-proxy](../deploy/blobfuse-proxy)
  - run controller on control plane node: `--set controller.runOnControlPlane=true`
  - set replica of controller as `1`: `--set controller.replicas=1`
@@ -18,7 +19,7 @@
 ### install a specific version
 ```console
 helm repo add blob-csi-driver https://raw.githubusercontent.com/kubernetes-sigs/blob-csi-driver/master/charts
-helm install blob-csi-driver blob-csi-driver/blob-csi-driver --set node.enableBlobfuseProxy=true --namespace kube-system --version v1.15.0
+helm install blob-csi-driver blob-csi-driver/blob-csi-driver --set node.enableBlobfuseProxy=true --namespace kube-system --version v1.20.1
 ```
 
 ## install on Azure Stack
@@ -65,16 +66,16 @@ The following table lists the configurable parameters of the latest Azure Blob S
 | `image.blob.tag`                                      | blob-csi-driver docker image tag                      | `latest`                                                         |
 | `image.blob.pullPolicy`                               | blob-csi-driver image pull policy                     | `IfNotPresent`                                                   |
 | `image.csiProvisioner.repository`                     | csi-provisioner docker image                          | `mcr.microsoft.com/oss/kubernetes-csi/csi-provisioner`           |
-| `image.csiProvisioner.tag`                            | csi-provisioner docker image tag                      | `v3.2.0`                                                         |
+| `image.csiProvisioner.tag`                            | csi-provisioner docker image tag                      | `v3.3.0`                                                         |
 | `image.csiProvisioner.pullPolicy`                     | csi-provisioner image pull policy                     | `IfNotPresent`                                                   |
 | `image.livenessProbe.repository`                      | liveness-probe docker image                           | `mcr.microsoft.com/oss/kubernetes-csi/livenessprobe`             |
-| `image.livenessProbe.tag`                             | liveness-probe docker image tag                       | `v2.7.0`                                                         |
+| `image.livenessProbe.tag`                             | liveness-probe docker image tag                       | `v2.8.0`                                                         |
 | `image.livenessProbe.pullPolicy`                      | liveness-probe image pull policy                      | `IfNotPresent`                                                   |
 | `image.nodeDriverRegistrar.repository`                | csi-node-driver-registrar docker image                | `mcr.microsoft.com/oss/kubernetes-csi/csi-node-driver-registrar` |
-| `image.nodeDriverRegistrar.tag`                       | csi-node-driver-registrar docker image tag            | `v2.5.1`                                                      |
+| `image.nodeDriverRegistrar.tag`                       | csi-node-driver-registrar docker image tag            | `v2.6.2`                                                      |
 | `image.nodeDriverRegistrar.pullPolicy`                | csi-node-driver-registrar image pull policy           | `IfNotPresent`                                                   |
 | `image.csiResizer.repository`                         | csi-resizer docker image                              | `mcr.microsoft.com/oss/kubernetes-csi/csi-resizer`               |
-| `image.csiResizer.tag`                                | csi-resizer docker image tag                          | `v1.5.0`                                                         |
+| `image.csiResizer.tag`                                | csi-resizer docker image tag                          | `v1.6.0`                                                         |
 | `image.csiResizer.pullPolicy`                         | csi-resizer image pull policy                         | `IfNotPresent`                                                   |
 | `imagePullSecrets`                                    | Specify docker-registry secret names as an array      | [] (does not add image pull secrets to deployed pods)          |
 | `cloud`                                               | the cloud environment the driver is running on        | `AzurePublicCloud`                                               |
@@ -119,13 +120,14 @@ The following table lists the configurable parameters of the latest Azure Blob S
 | `node.allowEmptyCloudConfig`                          | Whether allow running node driver without cloud config          | `true`
 | `node.allowInlineVolumeKeyAccessWithIdentity`         | Whether allow accessing storage account key using cluster identity for inline volume          | `false`
 | `node.maxUnavailable`                                 | `maxUnavailable` value of driver node daemonset       | `1`
-| `node.metricsPort`                                    | metrics port of csi-blob-node                         | `29635`                                                          |
 | `node.livenessProbe.healthPort `                      | health check port for liveness probe                  | `29633` |
 | `node.logLevel`                                       | node driver log level                                 | `5`                                                            |
 | `node.mountPermissions`                               | mounted folder permissions (only applies for NFS)                 | `0777`
 | `node.enableBlobfuseProxy`                            | enable blobfuse-proxy on agent node                           | `false`                                                          |
-| `node.blobfuseProxy.installBlobfuse`                  | whether install blobfuse on agent node| `true`                                                          |
-| `node.blobfuseProxy.blobfuseVersion`                  | installed blobfuse version on agent node| `1.4.2`                                                          |
+| `node.blobfuseProxy.installBlobfuse`                  | whether blobfuse should be installed on agent node| `true`                                                          |
+| `node.blobfuseProxy.blobfuseVersion`                  | installed blobfuse version on agent node (if the value is empty, it means that the latest version should be installed.) | ``                                                          |
+| `node.blobfuseProxy.installBlobfuse2`                 | whether blobfuse2 should be installed on agent node| `true`                                                          |
+| `node.blobfuseProxy.blobfuse2Version`                 | installed blobfuse2 version on agent node (if the value is empty, it means that the latest version should be installed.) | ``
 | `node.blobfuseProxy.setMaxOpenFileNum`                | whether set max open file num on agent node| `true`                                                          |
 | `node.blobfuseProxy.maxOpenFileNum`                   | max open file num on agent node| `9000000`                                                          |
 | `node.blobfuseProxy.disableUpdateDB`                  | whether disable updateDB on blobfuse (saving storage account list usage) | `true`                                                          |
